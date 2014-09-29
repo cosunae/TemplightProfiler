@@ -86,16 +86,18 @@ class TemplightHandler(xml.sax.ContentHandler):
               self._nskip[-1] = self._nskip[-1]-1
       elif len(self._stack):
           self._triggerAction[CloseNode] = True
-      elif self._activated:
-          self._triggerAction[RecordStop]=True
+          if len(self._stack)==1 and self._activated:
+              self._triggerAction[RecordStop]=True
 
       self._in_template_begin = False
     elif name == 'Context' and self._in_template_begin:
-        if(re.match(r'^StencilOpenMP',attrs['context'])) or self._activated:
+        if (not re.match(r'^boost::', attrs['context']) and not re.match(r'^std::',attrs['context']) and \
+                not re.match(r'^__gnu',attrs['context']) and not re.match(r'^mpl', attrs['context'])):
+#        if(re.match(r'^StencilOpenMP',attrs['context'])) or self._activated:
             if not self._activated:
                 self._triggerAction[RecordStart] = True
             if(not re.match(r'^boost::', attrs['context']) and not re.match(r'^std::',attrs['context']) and \
-                not re.match(r'^__gnu',attrs['context'])):
+                not re.match(r'^__gnu',attrs['context']) and not re.match(r'^mpl', attrs['context'])):
                 self._triggerAction[Instantiation] = attrs['context']
                 self._skip=False
             elif(len(self._stack)>0):
