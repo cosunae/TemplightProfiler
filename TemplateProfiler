@@ -1,0 +1,211 @@
+#!/usr/bin/python
+# Copyright (c) 2014, Carlos Osuna (Carlos.Osuna.Escamilla@gmail.com)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+# This code has been derived from the templight tools developed by Abel Sinkovics 
+# (https://github.com/sabel83/templight)
+
+import sys
+import xml.sax
+import re
+
+CloseNode = 0
+RecordStart = 1
+RecordStop = 2 
+Instantiation = 3
+
+class Node:
+    def __init__(self, tid, name, timestamp, memoized, parent):
+        self._tid = tid
+        self._name = name
+        self._children = []
+        self._starttime = float(timestamp)
+        self._stoptime = 0.0
+        self._memoized = memoized
+        self._parentNode = parent
+        self._childrenInclusiveTime = 0.0
+    def AddChild(self, node):
+        self._children.append(node)
+    def setStopTime(self,time):
+        self._stoptime = float(time)
+
+class TemplightHandler(xml.sax.ContentHandler):
+  def __init__(self):
+    # A context -> unique id mapping
+    self._ids = {}
+    self._next_id = 0
+
+    # Elements: (<from>, <to>, <memoizated>)
+    self._edges = []
+
+    # instantiation stack (The call-stack of template metaprograms)
+    self._stack = []
+
+    self._in_template_begin = False
+    self._nskip=[]
+    self._skip=False
+    self._activated=False
+    self._start=0.0
+    self._stop=0.0
+    self._totaltime=0.0
+    self._root_nodes = []
+    self._currentNode = None
+    self._triggerAction = {}
+
+    self._acc ={}
+    self._exnt = {}
+    self._maxacc=0
+
+  def startElement(self, name, attrs):
+#    if re.match(r'^boost::mpl', attrs['context']):
+#      return
+    if name == 'TemplateBegin':
+      self._in_template_begin = True
+    elif name == 'TemplateEnd':
+      assert (self._skip and len(self._stack)) or not self._skip
+
+      if self._skip:
+          assert len(self._nskip)>0
+          if self._nskip[-1]==1:
+              self._skip = False
+              self._nskip.pop()
+          else:
+              self._nskip[-1] = self._nskip[-1]-1
+      elif len(self._stack):
+          self._triggerAction[CloseNode] = True
+      elif self._activated:
+          self._triggerAction[RecordStop]=True
+
+      self._in_template_begin = False
+    elif name == 'Context' and self._in_template_begin:
+        if(re.match(r'^StencilOpenMP',attrs['context'])) or self._activated:
+            if not self._activated:
+                self._triggerAction[RecordStart] = True
+            if(not re.match(r'^boost::', attrs['context']) and not re.match(r'^std::',attrs['context']) and \
+                not re.match(r'^__gnu',attrs['context'])):
+                self._triggerAction[Instantiation] = attrs['context']
+                self._skip=False
+            elif(len(self._stack)>0):
+                if self._skip:
+                    self._nskip[-1] = self._nskip[-1]+1
+                else: 
+                    self._nskip.append(1)
+                self._skip=True
+    elif name == 'TimeStamp' and self._triggerAction:
+        if CloseNode in self._triggerAction:
+            self._currentNode.setStopTime(float(attrs['time']))
+
+            self._currentNode = self._currentNode._parentNode
+            self._stack.pop()
+        if RecordStart in self._triggerAction:
+            self._start = float(attrs['time'])
+            self._activated = True
+        elif RecordStop in self._triggerAction:
+            self._stop = float(attrs['time'])
+            self._totaltime = self._totaltime + self._stop - self._start
+            self._activated=False
+        if Instantiation in self._triggerAction:
+            self.instantiation_requested(attrs['time'], self._triggerAction[Instantiation])
+
+        self._triggerAction={}
+
+  def instantiation_requested(self, timestamp, name):
+    memoized = self.store(name)
+    tid = self._ids[name]
+    node = Node(tid, name,timestamp, memoized, self._currentNode)
+    if self._currentNode:
+        self._currentNode.AddChild(node)
+    else:
+        self._root_nodes.append(node)
+    self._currentNode = node
+    if len(self._stack) > 0:
+      self._edges.append((self._stack[-1], tid, memoized))
+    self._stack.append(tid)
+
+  # returns: was the node in the map?
+  def store(self, name):
+    if not self._ids.has_key(name):
+      self._ids[name] = 't%d' % (self._next_id)
+      self._next_id = self._next_id + 1
+      return False
+    else:
+      return True
+
+  def display(self):
+    print 'digraph G {'
+    print
+
+    for node in self._root_nodes:
+        self.AccumulateTimesMemoized(node)
+
+    for node in self._root_nodes:
+        self.PrintAll(node)
+
+    print
+    for (f, t, m) in self._edges:
+      if m:
+        style = "dashed"
+      else:
+        style = "solid"
+      print '  %s -> %s [style=%s];' % (f, t, style)
+    print
+    print '}'
+
+  def dfs(self, node):
+    for child in node._children:
+        node._childrenInclusiveTime = node._childrenInclusiveTime+self.dfs(child)
+    return node._stoptime - node._starttime
+
+  def AccumulateTimesMemoized(self, node):
+    self._acc[node._tid] = self._acc.setdefault(node._tid,0) + node._stoptime-node._starttime
+    self._exnt[node._tid] = self._exnt.setdefault(node._tid,0) + node._stoptime-node._starttime-node._childrenInclusiveTime
+    self._maxacc = max(self._maxacc, self._acc[node._tid])
+
+    for child in node._children:
+        self.AccumulateTimesMemoized(child)
+
+  def PrintAll(self, node):
+    shortname = node._name[:node._name.find('<')]
+    colors=["azure", "greenyellow","orange","orangered","red","maroon"]
+    color_idx = int((self._acc[node._tid])/self._maxacc / (1/float(len(colors))))
+    color_idx = min(color_idx, len(colors)-1)
+    acc='{0:.2f}'.format(self._acc[node._tid]/self._totaltime*100)
+    excl='{0:.2f}'.format(self._exnt[node._tid]/self._totaltime*100)
+    if not node._memoized:
+        print  '  '+node._tid+'  [label="'+shortname+'\\ntime='+str(node._stoptime-node._starttime)+\
+    '\\nacc='+acc+'\\nexcl='+\
+             excl+'", shape=Mrecord'  +',color='+ \
+             colors[color_idx]+',style=filled];'
+    for child in node._children:
+        self.PrintAll(child)
+
+  def FillTimes(self):
+    for rootnode in self._root_nodes:
+        self.dfs(rootnode)
+
+def main():
+  if len(sys.argv) == 2:
+    h = TemplightHandler()
+    xml.sax.parse(sys.argv[1], h)
+    assert not h._activated
+    h.FillTimes()
+    h.display()
+  else:
+    print 'Usage: %s <name of xml trace file>' % (sys.argv[0])
+
+if __name__ == '__main__':
+  main()
+
